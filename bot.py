@@ -7,7 +7,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 
 # Настройки
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("7143553038:AAE6zb78AiVbS8zHpgNeltw_jnWJKiCEGWU")
 UNSPLASH_API_KEY = os.getenv("UNSPLASH_API_KEY")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY")
