@@ -11,7 +11,7 @@ TOKEN = os.getenv("7143553038:AAE6zb78AiVbS8zHpgNeltw_jnWJKiCEGWU")
 UNSPLASH_API_KEY = os.getenv("UNSPLASH_API_KEY")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY")
-CHANNEL_ID = "@your_channel"  # Замени на username канала
+CHANNEL_ID = "@t.me/prosvetlyaka"
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
