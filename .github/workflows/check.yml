@@ -1,0 +1,33 @@
+name: Проверка канала
+
+on:
+  workflow_dispatch:
+    inputs:
+      send_test_post:
+        description: Отправить тестовый пост в канал
+        type: boolean
+        default: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Проверить связку бот → канал
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+        run: |
+          if [ "${{ inputs.send_test_post }}" = "false" ]; then
+            python -m afisha.cli check --no-post
+          else
+            python -m afisha.cli check
+          fi
