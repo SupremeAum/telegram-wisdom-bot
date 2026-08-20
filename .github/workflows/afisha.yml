@@ -1,0 +1,60 @@
+name: Афиша
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Опубликовать в Telegram (без галочки — только собрать на проверку)
+        type: boolean
+        default: false
+      days:
+        description: На сколько дней вперёд собирать
+        default: '14'
+      limit:
+        description: Сколько событий максимум
+        default: '10'
+  schedule:
+    - cron: '0 3 * * *'
+
+jobs:
+  afisha:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Шрифт для карточек
+        run: python fetch_fonts.py || echo "Inter не скачался — карточки будут на DejaVu"
+
+      - name: Собрать события
+        env:
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+        run: python -m afisha.cli draft --days "${{ inputs.days || 14 }}" --limit "${{ inputs.limit || 10 }}"
+
+      - name: Подготовить посты для WhatsApp
+        env:
+          WHATSAPP_CHANNEL_NAME: ${{ vars.WHATSAPP_CHANNEL_NAME }}
+          WHATSAPP_CHANNEL_URL: ${{ vars.WHATSAPP_CHANNEL_URL }}
+        run: python -m afisha.cli wa --all
+
+      - name: Опубликовать в Telegram
+        if: inputs.publish == true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+        run: python -m afisha.cli publish --yes
+
+      - name: Выложить посты на проверку
+        uses: actions/upload-artifact@v4
+        with:
+          name: posts
+          path: |
+            drafts/
+            outbox/
+          retention-days: 14
