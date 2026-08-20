@@ -1,2 +1,5 @@
-aiogram
-requests
+aiogram==3.15.0
+Pillow==11.0.0
+httpx==0.28.1
+beautifulsoup4==4.12.3
+python-dotenv==1.0.1
