@@ -175,42 +175,99 @@ def from_ticketon(client: httpx.Client) -> list[Event]:
     return events
 
 
+SXODIM_BASE = "https://sxodim.com"
+SXODIM_URL = f"{SXODIM_BASE}/ustkamenogorsk"
+
+# Карточка sxodim держит главное в data-атрибутах самого блока, а цену,
+# дату, площадку и адрес — одной строкой через запятую в .impression-card-info.
+# Страницы /events/week и /events/weekend отдают пустую вёрстку: список там
+# дорисовывается скриптами, поэтому берём городскую страницу целиком.
+SXODIM_CARD = "div.impression-card"
+SXODIM_TITLE = "a.impression-card-title"
+SXODIM_INFO = ".impression-card-info"
+SXODIM_IMAGE = ".impression-card-image"
+
+
+def _sxodim_info(text: str) -> tuple[datetime | None, str]:
+    """Разбирает «6000 тенге, 8 ноября в 19:00, Шишка Premium, ул. Бажова».
+
+    Порядок частей не постоянен: цены может не быть вовсе, а адрес сам
+    содержит запятые. Поэтому опираемся на дату — единственную часть,
+    которую можно опознать наверняка; площадка идёт сразу за ней.
+    """
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    for index, part in enumerate(parts):
+        starts_at = parse_ru_date(part)
+        if starts_at is None:
+            continue
+        return starts_at, parts[index + 1] if index + 1 < len(parts) else ""
+    return None, ""
+
+
+def _sxodim_image(card) -> str:
+    """Постер карточки: крупный вариант в <source srcset>, мелкий в <img>."""
+    holder = card.select_one(SXODIM_IMAGE)
+    if holder is None:
+        return ""
+
+    source = holder.select_one("source[srcset]")
+    if source is not None:
+        # srcset — список «адрес размер», нам нужен первый адрес.
+        candidate = source.get("srcset", "").split(",")[0].strip().split(" ")[0]
+        if candidate:
+            return _absolute(candidate, SXODIM_BASE)
+
+    return _image_url(holder, SXODIM_BASE)
+
+
 def from_sxodim(client: httpx.Client) -> list[Event]:
-    """sxodim.com — лучшие описания, много неконцертных событий."""
-    soup = _get(client, "https://sxodim.com/ustkamenogorsk")
+    """sxodim.com — главный источник афиши города.
+
+    Название, категорию и цену карточка отдаёт data-атрибутами, поэтому
+    из текста разбирается только строка с датой и площадкой.
+    """
+    soup = _get(client, SXODIM_URL)
     if soup is None:
         return []
 
+    cards = soup.select(SXODIM_CARD)
+    log.info("sxodim: карточек в разметке %d", len(cards))
+
     events: list[Event] = []
-    for card in soup.select("article, .event-card, .card"):
-        title_el = card.select_one("h2, h3, .card-title")
-        if not title_el:
+    skipped = 0
+
+    for card in cards:
+        link = card.select_one(SXODIM_TITLE)
+        title = (card.get("data-title") or "").strip()
+        if not title and link is not None:
+            title = link.get_text(strip=True)
+        if not title:
+            skipped += 1
             continue
-        title = title_el.get_text(strip=True)
 
-        date_el = card.select_one("time, .date, .card-date")
-        starts_at = parse_ru_date(date_el.get_text(" ", strip=True)) if date_el else None
-        if not starts_at:
+        info = card.select_one(SXODIM_INFO)
+        starts_at, venue = _sxodim_info(info.get_text(" ", strip=True)) if info else (None, "")
+        if starts_at is None:
+            # Без даты событие бесполезно, но молчать нельзя: так в логе
+            # видно, что у части карточек сменился формат строки.
+            log.info("sxodim: без даты — %s", title[:60])
+            skipped += 1
             continue
 
-        link = card.select_one("a[href]")
-        href = link.get("href", "") if link else ""
-        if href.startswith("/"):
-            href = f"https://sxodim.com{href}"
-
-        desc_el = card.select_one("p, .card-description")
-        venue_el = card.select_one(".place, .location")
+        price = (card.get("data-minprice") or "").strip()
 
         events.append(Event(
             title=title,
             starts_at=starts_at,
-            venue=venue_el.get_text(strip=True) if venue_el else "Усть-Каменогорск",
-            category=guess_category(title),
-            url=href,
-            description=desc_el.get_text(" ", strip=True)[:300] if desc_el else "",
-            image_url=_image_url(card, "https://sxodim.com"),
+            venue=venue or (card.get("data-partner") or "").strip() or "Усть-Каменогорск",
+            category=guess_category(title, card.get("data-category") or ""),
+            price=f"от {price} ₸" if price else "",
+            url=_absolute(link.get("href", "") if link else "", SXODIM_BASE),
+            image_url=_sxodim_image(card),
             source="sxodim",
         ))
+
+    log.info("sxodim: разобрано %d, пропущено %d", len(events), skipped)
     return events
 
 
