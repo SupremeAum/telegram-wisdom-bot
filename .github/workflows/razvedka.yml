@@ -1,0 +1,199 @@
+name: Разведка вёрстки
+
+# Ничего не публикует и ничего не меняет. Только скачивает страницу афиши
+# и печатает её структуру в лог, чтобы по этому логу написать точные селекторы.
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Какую страницу разведать
+        default: https://sxodim.com/ustkamenogorsk
+
+jobs:
+  razvedka:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install httpx beautifulsoup4
+
+      - name: Разведать страницу
+        env:
+          TARGET: ${{ inputs.url }}
+        run: |
+          python - <<'PY'
+          import collections
+          import json
+          import os
+          import re
+
+          import httpx
+          from bs4 import BeautifulSoup
+
+          url = os.environ.get("TARGET") or "https://sxodim.com/ustkamenogorsk"
+          ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+          print("=" * 70)
+          print("Разведка:", url)
+          print("=" * 70)
+
+          with httpx.Client(headers={"User-Agent": ua}, timeout=30,
+                            follow_redirects=True) as client:
+              r = client.get(url)
+
+          print("Статус:", r.status_code)
+          print("Итоговый адрес:", str(r.url))
+          print("Размер HTML:", len(r.text), "символов")
+          if r.status_code != 200:
+              print("Страница не отдалась — дальше смотреть нечего.")
+              raise SystemExit(0)
+
+          soup = BeautifulSoup(r.text, "html.parser")
+
+          # --- 1. Готовые данные в JSON: если они есть, парсить HTML не нужно ---
+          print()
+          print("### 1. Готовые данные на странице")
+
+          found_json = False
+          for tag in soup.select('script[type="application/ld+json"]'):
+              raw = tag.string or tag.get_text() or ""
+              try:
+                  data = json.loads(raw)
+              except Exception:
+                  continue
+              items = data if isinstance(data, list) else [data]
+              for item in items:
+                  if not isinstance(item, dict):
+                      continue
+                  kind = item.get("@type", "")
+                  kinds = kind if isinstance(kind, list) else [kind]
+                  if any("Event" in str(k) for k in kinds):
+                      found_json = True
+                      print("  НАЙДЕН schema.org Event — это лучший источник:")
+                      print("  " + json.dumps(item, ensure_ascii=False)[:900])
+                      break
+              if found_json:
+                  break
+
+          for name in ("__NEXT_DATA__", "__NUXT__", "__INITIAL_STATE__"):
+              if name in r.text:
+                  print("  на странице есть %s — данные лежат в JSON внутри HTML" % name)
+                  found_json = True
+
+          if not found_json:
+              print("  готового JSON нет, разбираем разметку")
+
+          # --- 2. Повторяющиеся блоки: так выглядят карточки событий ---
+          print()
+          print("### 2. Повторяющиеся блоки (кандидаты в карточки событий)")
+
+          date_re = re.compile(
+              r"\d{1,2}\s+(янв|фев|мар|апр|мая|май|июн|июл|авг|сен|окт|ноя|дек)"
+              r"|\d{1,2}[./]\d{1,2}", re.I)
+
+          counter = collections.Counter()
+          sample = {}
+          for el in soup.find_all(True):
+              classes = el.get("class") or []
+              if not classes:
+                  continue
+              key = "%s.%s" % (el.name, ".".join(classes))
+              has_link = el.find("a", href=True) is not None
+              text = el.get_text(" ", strip=True)
+              if has_link and 20 < len(text) < 600 and date_re.search(text):
+                  counter[key] += 1
+                  sample.setdefault(key, el)
+
+          if not counter:
+              print("  блоков с ссылкой и датой не найдено.")
+              print("  Скорее всего страница рисуется скриптами, и в исходном HTML")
+              print("  событий нет. Тогда нужен другой источник или их API.")
+          else:
+              print("  Формат: сколько_раз  селектор")
+              for key, count in counter.most_common(12):
+                  print("  %4d  %s" % (count, key))
+
+              print()
+              print("### 3. Как выглядит одна карточка изнутри")
+              for key, _ in counter.most_common(2):
+                  el = sample[key]
+                  print()
+                  print("--- %s ---" % key)
+                  html = el.prettify()
+                  print(html[:2500])
+                  if len(html) > 2500:
+                      print("... обрезано, всего %d символов" % len(html))
+
+          # --- 4. Где на странице лежат даты ---
+          print()
+          print("### 4. Элементы, похожие на дату")
+          shown = 0
+          for el in soup.find_all(["time", "span", "div", "p"]):
+              text = el.get_text(" ", strip=True)
+              if 3 < len(text) < 60 and date_re.search(text):
+                  classes = ".".join(el.get("class") or [])
+                  print("  %-28s %r" % (el.name + ("." + classes if classes else ""), text[:50]))
+                  shown += 1
+                  if shown >= 15:
+                      break
+          if not shown:
+              print("  дат в разметке не видно")
+
+          # --- 5. Сколько карточек в исходном HTML на самом деле ---
+          print()
+          print("### 5. Карточки в сыром HTML")
+          print("  вхождений impression-card:", r.text.count("impression-card"))
+          print("  вхождений data-id=:", r.text.count("data-id="))
+          print("  найдено разбором:", len(soup.select("div.impression-card")))
+
+          # --- 6. Работает ли постраничность на стороне сервера ---
+          print()
+          print("### 6. Пагинация")
+          joiner = "&" if "?" in url else "?"
+          with httpx.Client(headers={"User-Agent": ua}, timeout=30,
+                            follow_redirects=True) as client:
+              for page in (2, 3):
+                  probe = f"{url}{joiner}page={page}"
+                  try:
+                      pr = client.get(probe)
+                  except Exception as exc:
+                      print("  страница %d: запрос не прошёл (%s)" % (page, exc))
+                      continue
+                  cards = BeautifulSoup(pr.text, "html.parser").select("div.impression-card")
+                  same = pr.text == r.text
+                  print("  страница %d: статус %s, карточек %d%s"
+                        % (page, pr.status_code, len(cards),
+                           ", содержимое как у первой" if same else ""))
+
+          # --- 7. Чем страница догружает список ---
+          print()
+          print("### 7. Подсказки о догрузке")
+          modules = sorted({el.get("data-module") for el in soup.select("[data-module]")
+                            if el.get("data-module")})
+          if modules:
+              print("  data-module:", ", ".join(modules))
+
+          for needle in ("ajax", "load-more", "loadMore", "infinite", "/api/", "page="):
+              count = r.text.lower().count(needle.lower())
+              if count:
+                  spot = r.text.lower().find(needle.lower())
+                  around = r.text[max(0, spot - 90): spot + 90].replace("\n", " ")
+                  print("  «%s» встречается %d раз, рядом: …%s…" % (needle, count, around.strip()))
+
+          buttons = soup.select("[class*='more'], [class*='pagination'], [class*='pager']")
+          for el in buttons[:5]:
+              print("  кнопка/пагинация: <%s class=%r %s>" % (
+                  el.name, " ".join(el.get("class") or []),
+                  " ".join("%s=%r" % (k, v) for k, v in el.attrs.items()
+                           if k.startswith("data-") or k == "href")))
+          if not buttons:
+              print("  кнопок «показать ещё» и пагинации в разметке нет")
+
+          print()
+          print("Разведка закончена.")
+          PY
