@@ -35,6 +35,116 @@ jobs:
           from bs4 import BeautifulSoup
 
           url = os.environ.get("TARGET") or "https://sxodim.com/ustkamenogorsk"
+
+          # Если адресов несколько через запятую — это прозвон площадок,
+          # а не подробный разбор одной страницы.
+          if "," in url:
+              import collections
+
+              DEFAULT = [
+                  # билетные операторы
+                  "https://ticketon.kz/oskemen",
+                  "https://www.topbilet.kz/",
+                  "https://topbilet.kz/ust-kamenogorsk",
+                  # карты и справочники
+                  "https://2gis.kz/ustkaman",
+                  # городские новости с разделом афиши
+                  "https://yk-news.kz/",
+                  "https://ustinka.kz/",
+                  "https://altaynews.kz/",
+                  # sxodim в других разрезах — для сравнения
+                  "https://sxodim.com/ustkamenogorsk/events/today",
+              ]
+
+              urls = [u.strip() for u in re.split(r"[,\n]", url) if u.strip()] or DEFAULT
+
+              ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+              date_re = re.compile(
+                  r"\d{1,2}\s+(янв|фев|мар|апр|мая|май|июн|июл|авг|сен|окт|ноя|дек)", re.I)
+
+              print("Прозваниваю %d адресов\n" % len(urls))
+
+              good = []
+              with httpx.Client(headers={"User-Agent": ua}, timeout=25,
+                                follow_redirects=True) as client:
+                  for url in urls:
+                      print("=" * 68)
+                      print(url)
+                      try:
+                          r = client.get(url)
+                      except Exception as exc:
+                          print("  НЕ ОТВЕТИЛ: %s" % exc)
+                          continue
+
+                      print("  статус %s, размер %d" % (r.status_code, len(r.text)))
+                      if r.status_code == 403:
+                          print("  ЗАКРЫТ для серверных адресов — не наш вариант")
+                          continue
+                      if r.status_code != 200:
+                          print("  адрес не открылся — возможно, другой путь")
+                          continue
+
+                      soup = BeautifulSoup(r.text, "html.parser")
+                      # Публичный Telegram-канал: посты лежат в tgme_widget_message.
+                      if "t.me/s/" in url:
+                          posts = soup.select(".tgme_widget_message")
+                          with_date = 0
+                          samples = []
+                          for post in posts:
+                              body = post.select_one(".tgme_widget_message_text")
+                              text = body.get_text(" ", strip=True) if body else ""
+                              if date_re.search(text):
+                                  with_date += 1
+                                  if len(samples) < 2:
+                                      samples.append(text[:220])
+                          print("  постов: %d, из них с датой: %d" % (len(posts), with_date))
+                          for sample in samples:
+                              print("    … %s" % sample)
+                          if with_date:
+                              good.append((url, with_date, "telegram"))
+                          elif posts:
+                              print("  посты есть, но дат в них не видно")
+                          continue
+                      title = soup.select_one("title")
+                      if title:
+                          print("  заголовок: %s" % title.get_text(strip=True)[:80])
+
+                      dates = date_re.findall(soup.get_text(" ", strip=True))
+                      print("  дат вида «12 сентября» в тексте: %d" % len(dates))
+
+                      # Повторяющиеся блоки со ссылкой и датой — это и есть карточки.
+                      counter = collections.Counter()
+                      for el in soup.find_all(True):
+                          classes = el.get("class") or []
+                          if not classes:
+                              continue
+                          text = el.get_text(" ", strip=True)
+                          if (el.find("a", href=True) is not None
+                                  and 20 < len(text) < 600 and date_re.search(text)):
+                              counter["%s.%s" % (el.name, ".".join(classes))] += 1
+
+                      if counter:
+                          print("  похоже на карточки событий:")
+                          for key, count in counter.most_common(4):
+                              print("    %4d  %s" % (count, key))
+                          best = counter.most_common(1)[0]
+                          good.append((url, best[1], best[0]))
+                      else:
+                          print("  повторяющихся блоков с датой нет")
+
+              print()
+              print("=" * 68)
+              print("ИТОГ")
+              if good:
+                  for url, count, selector in sorted(good, key=lambda x: -x[1]):
+                      print("  %4d карточек  %s  (%s)" % (count, url, selector))
+                  print()
+                  print("Годные источники есть — можно писать парсер.")
+              else:
+                  print("  ни один адрес не дал списка событий")
+              raise SystemExit(0)
+
           ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
