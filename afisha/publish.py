@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 from aiogram import Bot
@@ -22,6 +23,36 @@ def make_bot(token: str) -> Bot:
         token=token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+
+
+async def _send_alert(token: str, chat_id: str, text: str) -> None:
+    bot = make_bot(token)
+    try:
+        await bot.send_message(chat_id=chat_id, text=text,
+                               disable_web_page_preview=True)
+    finally:
+        await bot.session.close()
+
+
+def send_alert(text: str) -> bool:
+    """Шлёт тревогу в чат из TELEGRAM_ALERT_CHAT_ID. True — если ушла.
+
+    Канал сюда намеренно не подставляется: «афиша не собралась» — весть
+    для хозяина бота, подписчикам её видеть незачем. Без токена или без
+    адреса чата молча возвращаем False: тревога не должна ронять запуск
+    сильнее, чем уже уронила его причина.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_ALERT_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return False
+
+    try:
+        asyncio.run(_send_alert(token, chat_id, text))
+        return True
+    except Exception as exc:                       # noqa: BLE001 — сеть внешняя
+        log.warning("не удалось отправить тревогу: %s", exc)
+        return False
 
 
 async def publish_draft(bot: Bot, channel_id: str, draft: Draft) -> int:
