@@ -25,7 +25,7 @@ from .card import render
 from .compose import HTML, WHATSAPP, build_caption
 from .models import Draft
 from .poster import try_build as try_poster
-from .publish import make_bot, publish_draft, run_diagnose
+from .publish import make_bot, publish_draft, run_diagnose, send_alert
 from .whatsapp import export as export_whatsapp
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -86,10 +86,22 @@ def cmd_draft(args: argparse.Namespace) -> None:
     events = collect(days_ahead=args.days)
 
     if not events:
+        # Пустой результат — самая опасная поломка. Раньше запуск на нём
+        # заканчивался зелёной галочкой, и неделю тишины в канале было
+        # видно только по самому каналу. Теперь он падает и зовёт.
         print("Событий не найдено. Возможные причины:")
         print("  • сменилась вёрстка источника — проверь селекторы в afisha/sources.py")
         print("  • нет доступа к сайтам афиш из этой сети")
-        return
+
+        if send_alert("⚠️ Афиша: сбор не нашёл ни одного события.\n"
+                      "Скорее всего сменилась вёрстка источника — "
+                      "загляни в лог последнего запуска."):
+            print("Тревога отправлена в чат из TELEGRAM_ALERT_CHAT_ID.")
+        else:
+            print("Тревога никуда не ушла: задай секреты TELEGRAM_BOT_TOKEN "
+                  "и TELEGRAM_ALERT_CHAT_ID, чтобы получать её в Telegram.")
+
+        raise SystemExit(1)
 
     prefer_poster = os.getenv("PREFER_SOURCE_POSTER", "1").strip() != "0"
     created = posters = 0
