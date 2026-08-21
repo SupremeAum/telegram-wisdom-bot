@@ -34,7 +34,7 @@ CATEGORY_KEYWORDS = {
     "concert": ("концерт", "музык", "джаз", "рок", "симфон", "филармон"),
     "theatre": ("спектакль", "театр", "драм", "комеди", "опер", "балет"),
     "expo": ("выставк", "экспози", "галере", "музей", "арт"),
-    "kids": ("детск", "малыш", "школьн", "семейн", "сказк"),
+    "kids": ("детск", "детям", "малыш", "школьн", "семейн", "сказк"),
     "party": ("вечеринк", "party", "диджей", "dj", "клуб"),
 }
 
@@ -136,8 +136,13 @@ def _get(client: httpx.Client, url: str) -> BeautifulSoup | None:
         return None
 
 
-def from_ticketon(client: httpx.Client) -> list[Event]:
-    """ticketon.kz — билетный оператор, самые надёжные дата и цена."""
+def from_ticketon(client: httpx.Client, days_ahead: int = 14) -> list[Event]:
+    """ticketon.kz — билетный оператор, самые надёжные дата и цена.
+
+    Сейчас почти всегда пуст: ticketon отвечает 403 на запросы с серверных
+    адресов, в том числе с раннеров GitHub Actions. Источник оставлен на
+    случай, если доступ появится; на счёт найденных событий он не влияет.
+    """
     soup = _get(client, "https://ticketon.kz/ustkamenogorsk")
     if soup is None:
         return []
@@ -176,36 +181,28 @@ def from_ticketon(client: httpx.Client) -> list[Event]:
 
 
 SXODIM_BASE = "https://sxodim.com"
-SXODIM_URL = f"{SXODIM_BASE}/ustkamenogorsk"
+SXODIM_CITY = "ustkamenogorsk"
 
-# Карточка sxodim держит главное в data-атрибутах самого блока, а цену,
-# дату, площадку и адрес — одной строкой через запятую в .impression-card-info.
-# Страницы /events/week и /events/weekend отдают пустую вёрстку: список там
-# дорисовывается скриптами, поэтому берём городскую страницу целиком.
+# Карточка события на sxodim. Разведка вёрстки 21.08.2026 показала такую структуру:
+#
+#   <div class="impression-card" data-id="76769" data-category="Концерты"
+#        data-minprice="6 000" data-title="…">
+#     <div class="impression-card-image"><a href="…"><picture><img src="/uploads/…">
+#     <a class="impression-card-title" href="…">Название</a>
+#     <div class="impression-card-info">6000 тенге, 27 октября в 18:00, Филармония, ул. …</div>
+#
+# Всё нужное лежит либо в data-атрибутах, либо в одной строке info через запятую.
 SXODIM_CARD = "div.impression-card"
-SXODIM_TITLE = "a.impression-card-title"
-SXODIM_INFO = ".impression-card-info"
 SXODIM_IMAGE = ".impression-card-image"
 
 
-def _sxodim_info(text: str) -> tuple[datetime | None, str]:
-    """Разбирает «6000 тенге, 8 ноября в 19:00, Шишка Premium, ул. Бажова».
-
-    Порядок частей не постоянен: цены может не быть вовсе, а адрес сам
-    содержит запятые. Поэтому опираемся на дату — единственную часть,
-    которую можно опознать наверняка; площадка идёт сразу за ней.
-    """
-    parts = [part.strip() for part in text.split(",") if part.strip()]
-    for index, part in enumerate(parts):
-        starts_at = parse_ru_date(part)
-        if starts_at is None:
-            continue
-        return starts_at, parts[index + 1] if index + 1 < len(parts) else ""
-    return None, ""
-
-
 def _sxodim_image(card) -> str:
-    """Постер карточки: крупный вариант в <source srcset>, мелкий в <img>."""
+    """Постер карточки.
+
+    Ищем строго внутри блока с картинкой: рядом в карточке лежит иконка
+    рассрочки, и общий поиск по <img> подхватывает её, когда постера нет.
+    Крупный вариант объявлен в <source srcset>, мелкий — в <img src>.
+    """
     holder = card.select_one(SXODIM_IMAGE)
     if holder is None:
         return ""
@@ -220,55 +217,110 @@ def _sxodim_image(card) -> str:
     return _image_url(holder, SXODIM_BASE)
 
 
-def from_sxodim(client: httpx.Client) -> list[Event]:
-    """sxodim.com — главный источник афиши города.
+def _sxodim_pages(days_ahead: int) -> list[str]:
+    """Страницы sxodim, которые стоит обойти.
 
-    Название, категорию и цену карточка отдаёт data-атрибутами, поэтому
-    из текста разбирается только строка с датой и площадкой.
+    Первой идёт поиск по диапазону дат — она отдаёт ровно нужный горизонт.
+    Остальные подстраховывают: если поиск сменит адрес или вернёт пусто,
+    события всё равно наберутся с недельной и главной страницы.
     """
-    soup = _get(client, SXODIM_URL)
-    if soup is None:
-        return []
+    today = datetime.now()
+    until = today + timedelta(days=days_ahead)
+    return [
+        (f"{SXODIM_BASE}/{SXODIM_CITY}/search-events"
+         f"?date_from={today:%d.%m.%Y}&date_to={until:%d.%m.%Y}"),
+        f"{SXODIM_BASE}/{SXODIM_CITY}/events/week",
+        f"{SXODIM_BASE}/{SXODIM_CITY}",
+    ]
 
-    cards = soup.select(SXODIM_CARD)
-    log.info("sxodim: карточек в разметке %d", len(cards))
 
-    events: list[Event] = []
-    skipped = 0
+def _split_info(info: str) -> tuple[datetime | None, str, str]:
+    """Разбирает строку вида «6000 тенге, 27 октября в 18:00, Филармония, ул. …».
 
-    for card in cards:
-        link = card.select_one(SXODIM_TITLE)
-        title = (card.get("data-title") or "").strip()
-        if not title and link is not None:
-            title = link.get_text(strip=True)
-        if not title:
-            skipped += 1
+    Дату ищем посегментно, а не во всей строке: в цене тоже есть числа,
+    и «6000 тенге» разбирается как «00 тен(геден)» — то есть как несуществующий
+    месяц. Разделив по запятым, мы гарантированно смотрим только на дату.
+    Что до сегмента с датой — цена, что после — площадка.
+    """
+    parts = [part.strip() for part in info.split(",") if part.strip()]
+    for index, part in enumerate(parts):
+        starts_at = parse_ru_date(part)
+        if starts_at:
+            price = ", ".join(parts[:index])
+            venue = parts[index + 1] if index + 1 < len(parts) else ""
+            return starts_at, price, venue
+    return None, "", ""
+
+
+def _sxodim_card(card) -> Event | None:
+    """Собирает событие из одной карточки. None — если это не событие."""
+    title_el = card.select_one("a.impression-card-title")
+    title = (card.get("data-title") or "").strip()
+    if not title and title_el is not None:
+        title = title_el.get_text(strip=True)
+    if not title:
+        return None
+
+    info_el = card.select_one(".impression-card-info")
+    info = info_el.get_text(" ", strip=True) if info_el else ""
+    starts_at, price_text, venue = _split_info(info)
+    if not starts_at:
+        # Без даты пост не запланировать, а гадать по названию нельзя.
+        return None
+
+    href = ""
+    if title_el is not None:
+        href = title_el.get("href") or ""
+    if not href:
+        link = card.select_one(".impression-card-image a[href]")
+        href = link.get("href") if link else ""
+
+    # data-minprice чище текста: «6 000» вместо «6000 теңгеден бастап».
+    minprice = (card.get("data-minprice") or "").strip()
+    price = f"от {minprice} ₸" if minprice else price_text
+
+    return Event(
+        title=title,
+        starts_at=starts_at,
+        venue=venue or (card.get("data-partner") or "").strip() or "Усть-Каменогорск",
+        category=guess_category(title, card.get("data-category") or ""),
+        price=price,
+        url=_absolute(href, SXODIM_BASE),
+        image_url=_sxodim_image(card),
+        source="sxodim",
+    )
+
+
+def from_sxodim(client: httpx.Client, days_ahead: int = 14) -> list[Event]:
+    """sxodim.com — основной источник: отдаёт обычный HTML без скриптов."""
+    events: dict[str, Event] = {}
+
+    for url in _sxodim_pages(days_ahead):
+        soup = _get(client, url)
+        if soup is None:
             continue
 
-        info = card.select_one(SXODIM_INFO)
-        starts_at, venue = _sxodim_info(info.get_text(" ", strip=True)) if info else (None, "")
-        if starts_at is None:
-            # Без даты событие бесполезно, но молчать нельзя: так в логе
-            # видно, что у части карточек сменился формат строки.
-            log.info("sxodim: без даты — %s", title[:60])
-            skipped += 1
-            continue
+        cards = soup.select(SXODIM_CARD)
+        added = skipped = 0
+        for card in cards:
+            event = _sxodim_card(card)
+            if event is None:
+                skipped += 1
+                continue
+            # data-id — самый надёжный ключ: одно событие попадает
+            # и в поиск, и в недельную подборку.
+            key = card.get("data-id") or event.fingerprint
+            if key not in events:
+                events[key] = event
+                added += 1
 
-        price = (card.get("data-minprice") or "").strip()
+        log.info("sxodim %s: карточек %d, событий %d, отброшено %d",
+                 url, len(cards), added, skipped)
+        if not cards:
+            log.warning("на %s не нашлось ни одной карточки %s — "
+                        "возможно, сменилась вёрстка", url, SXODIM_CARD)
 
-        events.append(Event(
-            title=title,
-            starts_at=starts_at,
-            venue=venue or (card.get("data-partner") or "").strip() or "Усть-Каменогорск",
-            category=guess_category(title, card.get("data-category") or ""),
-            price=f"от {price} ₸" if price else "",
-            url=_absolute(link.get("href", "") if link else "", SXODIM_BASE),
-            image_url=_sxodim_image(card),
-            source="sxodim",
-        ))
-
-    log.info("sxodim: разобрано %d, пропущено %d", len(events), skipped)
-    return events
+    return list(events.values())
 
 
 SOURCES = {"ticketon": from_ticketon, "sxodim": from_sxodim}
@@ -283,7 +335,7 @@ def collect(days_ahead: int = 14) -> list[Event]:
                       follow_redirects=True) as client:
         for name, parser in SOURCES.items():
             try:
-                found = parser(client)
+                found = parser(client, days_ahead)
                 log.info("%s: найдено %d событий", name, len(found))
             except Exception as exc:               # noqa: BLE001
                 log.warning("источник %s упал: %s", name, exc)
